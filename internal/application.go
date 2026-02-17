@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -157,6 +158,14 @@ func (a *Application) HandleRequest(ctx context.Context, writer *encoding.Action
 	defer func() {
 		_ = writer.SetInt64(encoding.VarScopeTransaction, "trigger",
 			countTriggeredRules(tx.MatchedRules()))
+			
+		// Send anomaly_score -> HAProxy
+		_ = writer.SetInt64(encoding.VarScopeTransaction, "anomaly_score",
+			getAnomalyScore(tx))
+		
+        // Sends the triggered rule IDs to HAProxy
+		_ = writer.SetString(encoding.VarScopeTransaction, "ruleid",
+			getTriggeredRuleIDs(tx))		
 	}()
 
 	if err := writer.SetString(encoding.VarScopeTransaction, "id", tx.ID()); err != nil {
@@ -312,6 +321,14 @@ func (a *Application) HandleResponse(ctx context.Context, writer *encoding.Actio
 	defer func() {
 		_ = writer.SetInt64(encoding.VarScopeTransaction, "trigger",
 			countTriggeredRules(tx.MatchedRules()))
+			
+		// Updates/sends the anomaly_score variable after analyzing the response.
+		_ = writer.SetInt64(encoding.VarScopeTransaction, "anomaly_score",
+			getAnomalyScore(tx))
+			
+		// Sends the triggered rule IDs to HAProxy
+		_ = writer.SetString(encoding.VarScopeTransaction, "ruleid",
+			getTriggeredRuleIDs(tx))
 	}()
 
 	if tx.IsRuleEngineOff() {
@@ -485,12 +502,69 @@ func (e ErrInterrupted) Is(target error) bool {
 	return e.Interruption == t.Interruption
 }
 
+// countTriggeredRules returns the number of actual attack rules triggered
 func countTriggeredRules(rules []types.MatchedRule) int64 {
 	var count int64
 	for _, mr := range rules {
-		if mr.Message() != "" {
+		// Ignore rules without a message (silent control flow rules)
+		if mr.Message() == "" {
+			continue
+		}
+		if isAttackRule(mr.Rule().ID()) {
 			count++
 		}
 	}
 	return count
+}
+
+// getAnomalyScore calculates the anomaly score based on CRS attack ranges
+func getAnomalyScore(tx types.Transaction) int64 {
+	var score int64
+
+	for _, mr := range tx.MatchedRules() {
+		// Ignore rules without a message (silent control flow rules)
+		if mr.Message() == "" {
+			continue
+		}
+		if !isAttackRule(mr.Rule().ID()) {
+			continue
+		}
+
+		// Calculate the score based on standard CRS v4 severity mappings.
+		switch mr.Rule().Severity() {
+		case types.RuleSeverityEmergency, types.RuleSeverityAlert, types.RuleSeverityCritical:
+			score += 5
+		case types.RuleSeverityError:
+			score += 4
+		case types.RuleSeverityWarning:
+			score += 3
+		case types.RuleSeverityNotice:
+			score += 2
+		}
+	}
+
+	return score
+}
+
+// getTriggeredRuleIDs returns a comma-separated string of the triggered attack rule IDs
+func getTriggeredRuleIDs(tx types.Transaction) string {
+	var ids []string
+	for _, mr := range tx.MatchedRules() {
+		// Ignore rules without a message (silent control flow rules)
+		if mr.Message() == "" {
+			continue
+		}
+		if !isAttackRule(mr.Rule().ID()) {
+			continue
+		}
+		ids = append(ids, strconv.Itoa(mr.Rule().ID()))
+	}
+	return strings.Join(ids, ",")
+}
+
+// isAttackRule checks if the rule ID belongs to the actual CRS attack ranges
+func isAttackRule(ruleID int) bool {
+	isInboundAttack := ruleID >= 910000 && ruleID <= 948999
+	isOutboundAttack := ruleID >= 950000 && ruleID <= 958999
+	return isInboundAttack || isOutboundAttack
 }
